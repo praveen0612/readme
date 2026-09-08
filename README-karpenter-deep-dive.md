@@ -12,6 +12,7 @@ Adobe Ad Cloud Monorepo — Node Autoscaling Review
 - [6. Cilium Relationship](#6-cilium-relationship)
 - [7. Cluster-Autoscaler Status](#7-cluster-autoscaler-status)
 - [8. How Data/Metrics Capture Works](#8-how-datametrics-capture-works)
+- [9. Fresh Setup — Production-Ready Karpenter on a New Cluster](#9-fresh-setup--production-ready-karpenter-on-a-new-cluster)
 
 ---
 
@@ -164,4 +165,136 @@ Prometheus stores: karpenter_cluster_state_synced,
 
 ---
 
-*Compiled from a read-only review of the adCloud monorepo (`cloud/kube-system/`, `argo/ArgoCD/`, vendored Helm chart, per-cluster `values.yaml`) — September 2026.*
+## 9. Fresh Setup — Production-Ready Karpenter on a New Cluster
+
+**Framing:** this section is a recommended, production-grade setup plan built from this org's own working reference config (Sections 3–8 above), plus standard Karpenter best practices for gaps this fleet currently leaves open (interruption handling, startup taints). It is not a transcription of an existing internal runbook — treat it as a plan to review with your team, test in dev/uat first, and adapt to your actual cluster's tags/CIDRs/account IDs before touching prod.
+
+### Step 0 — Prerequisites
+
+Before installing Karpenter, the cluster needs:
+- An EKS cluster with an **OIDC provider** enabled (required for IRSA — Karpenter's controller authenticates to AWS via IRSA, not static keys).
+- Subnets and security groups **tagged for discovery**, e.g. `karpenter.sh/discovery: <cluster-name>` on every subnet/SG Karpenter should be allowed to use. This is what `subnetSelectorTerms`/`securityGroupSelectorTerms` in EC2NodeClass match against — get this tag applied consistently at the Terraform/VPC level before writing any EC2NodeClass.
+- A **stable, non-Karpenter-managed node group** (e.g. a small on-demand managed node group or Fargate profile) to run the Karpenter controller itself on — Karpenter can't safely scale the very node it's running on down to zero, so it needs a floor of guaranteed capacity outside its own management.
+- Decide your **AMI strategy now**: this org bakes a custom AMI (`amiFamily: Custom`, pinned `amiSelectorTerms`) via Puppet, matching their existing worker-node bootstrap process. If you don't have an equivalent custom-AMI pipeline, using `amiFamily: AL2023` (Karpenter's own managed AMI resolution) is simpler and lower-maintenance for a new setup — pick one and be consistent; don't mix both patterns on the same cluster.
+
+### Step 1 — IAM (two separate roles, don't conflate them)
+
+**Controller role** (IRSA):
+```yaml
+# Trust policy: allow the karpenter ServiceAccount (via OIDC) to assume this role
+# Permissions policy needs, at minimum:
+ec2:CreateFleet, ec2:RunInstances, ec2:TerminateInstances,
+ec2:DescribeInstances, ec2:DescribeInstanceTypes, ec2:DescribeImages,
+ec2:DescribeSubnets, ec2:DescribeSecurityGroups, ec2:DescribeLaunchTemplates,
+ec2:CreateTags, ec2:CreateLaunchTemplate, ec2:DeleteLaunchTemplate,
+iam:PassRole (scoped to the node role only),
+eks:DescribeCluster,
+pricing:GetProducts (for spot/on-demand price lookups),
+sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueUrl, sqs:GetQueueAttributes
+  (only if interruption handling is enabled — see Step 3)
+```
+Bind this to the `karpenter` ServiceAccount via `eks.amazonaws.com/role-arn`, matching the pattern already used across this org's 7 clusters.
+
+**Node role**: a standard EKS worker-node IAM role (the three AWS-managed policies: `AmazonEKSWorkerNodePolicy`, `AmazonEKS_CNI_Policy`, `AmazonEC2ContainerRegistryReadOnly`, plus SSM if you want Session Manager access to nodes). Reference this role directly in every EC2NodeClass's `spec.role` field — Karpenter v1 creates the instance profile for you from this role, you do not need to pre-create an instance profile.
+
+### Step 2 — Install Karpenter (Helm)
+
+```bash
+helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+  --version "1.4.0" \
+  --namespace kube-system \
+  --set settings.clusterName=<cluster-name> \
+  --set settings.interruptionQueue=<cluster-name>-karpenter \
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<controller-role-arn> \
+  --set controller.resources.requests.cpu=1 \
+  --set controller.resources.requests.memory=1Gi \
+  --set replicas=2 \
+  --wait
+```
+`replicas: 2` (not the default 1) is a production-readiness call — Karpenter supports leader-election HA, and running a single replica means any pod eviction/node issue on that one pod briefly halts all node provisioning cluster-wide. This org's own clusters should be checked for whether they already do this; if not, it's worth adopting regardless of what's there today.
+
+Pin the ServiceMonitor and PrometheusRule from Section 8 at install time, not as an afterthought — import the same 4 alert pairs (`KarpenterClusterStateDesynced`, `KarpenterPodPending`, `KarpenterNoProvisioningActivity`, `KarpenterNodeClaimNotReady`) and the vendored Grafana dashboard from day one, matching the existing fleet.
+
+### Step 3 — Interruption handling (do this even if you start on-demand-only)
+
+This fleet currently skips this because it runs zero spot capacity (see Section 5) — but for a **new, prod-ready setup**, wire it up from the start regardless of your initial capacity-type choice, since it's cheap to set up now and expensive to retrofit once workloads depend on its absence:
+
+1. Create an SQS queue named to match `settings.interruptionQueue` above (e.g. `<cluster-name>-karpenter`).
+2. Add an EventBridge rule routing these events to that queue: `AWS Health Event` (for `EC2 Instance Rebalance Recommendation` and `EC2 Spot Instance Interruption Warning`), `EC2 Instance State-change Notification`, and `EC2 Instance Rebalance Recommendation`.
+3. Grant the controller role `sqs:ReceiveMessage`/`DeleteMessage`/`GetQueueUrl`/`GetQueueAttributes` on that queue (already listed in Step 1).
+
+With this in place, Karpenter gets ~2 minutes' advance notice on spot reclaim and can cordon/drain gracefully instead of losing the node abruptly — this is what makes it *safe* to adopt spot capacity later without a separate migration project.
+
+### Step 4 — Default NodePool + EC2NodeClass
+
+Start with one general-purpose NodePool, modeled on this org's own `dedicated-nodepool` pattern but simplified:
+
+```yaml
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiFamily: AL2023   # or Custom, per your Step 0 decision
+  role: <node-role-name>
+  subnetSelectorTerms:
+    - tags: {karpenter.sh/discovery: <cluster-name>}
+  securityGroupSelectorTerms:
+    - tags: {karpenter.sh/discovery: <cluster-name>}
+  tags:
+    karpenter.sh/discovery: <cluster-name>
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - {key: kubernetes.io/arch, operator: In, values: ["amd64"]}
+        - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
+        - {key: karpenter.k8s.aws/instance-category, operator: In, values: ["m", "r", "c"]}
+        - {key: karpenter.k8s.aws/instance-generation, operator: Gt, values: ["4"]}
+      nodeClassRef: {group: karpenter.k8s.aws, kind: EC2NodeClass, name: default}
+      expireAfter: 720h   # 30d — forces periodic node refresh (AMI/patch currency),
+                          # unlike this org's `Never`; recommended default for prod
+      startupTaints:
+        - {key: node.cilium.io/agent-not-ready, effect: NoExecute, value: "true"}
+        # ^ ENABLE this if running Cilium — this org has it present but disabled
+        #   everywhere (see Section 6); for a fresh prod setup, turn it ON.
+  limits: {cpu: 1000, memory: 4000Gi}   # size to your actual capacity ceiling
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m
+    budgets:
+      - {nodes: "10%"}
+      - {duration: 8h, nodes: "0", schedule: "0 9 * * mon-fri"}
+        # example: no consolidation during a Monday-Friday business-hours window,
+        # mirroring this org's own dedicated-nodepool pattern
+```
+
+Key production-readiness deltas from what this org currently runs:
+- `expireAfter: 720h` instead of `Never` — periodic forced node replacement keeps AMI/kernel patches current; `Never` (as used in this org's `trino-arm64-nodepool`) is a deliberate tradeoff for workload stability that you should only copy if you have a good reason (e.g. long-running stateful jobs sensitive to node churn).
+- `startupTaints` for Cilium **enabled**, not left commented out — closes the pod-scheduled-before-CNI-ready gap flagged in Section 6.
+- A real business-hours consolidation budget from day one, not something bolted on after an incident.
+
+### Step 5 — Protect critical workloads from disruption
+
+Add `karpenter.sh/do-not-disrupt: "true"` as a pod annotation (not a NodePool-level setting) on anything that must never be evicted by consolidation — single-replica stateful workloads, long-running batch jobs, etc. This is a per-pod opt-out, so it needs to be part of your workload deployment templates, not something Karpenter config alone can enforce.
+
+### Step 6 — Validate before trusting it in prod
+
+1. Deploy a throwaway deployment requesting more CPU than any existing node group has free — confirm Karpenter provisions a new node within ~60-90 seconds and the pod schedules.
+2. Scale that deployment to zero — confirm the node is consolidated away within `consolidateAfter` (5m in the example above), respecting the disruption budget.
+3. Manually terminate a Karpenter-provisioned node via the EC2 console (or trigger a real spot interruption in a non-prod account) — confirm the interruption queue path drains it gracefully rather than the pod just disappearing.
+4. Confirm `KarpenterClusterStateDesynced` and the other 3 alerts fire correctly by temporarily breaking the controller's IAM permissions in a test cluster and watching the alert trip — don't wait for a real prod incident to discover the alerting doesn't work.
+5. Confirm the Grafana dashboard renders real data (node/pod distribution, nodepool usage %) before calling the rollout done.
+
+### Step 7 — Rollback plan
+
+Define before go-live: if Karpenter misbehaves in prod (e.g. runaway provisioning, wrong instance types, cost spike), the fastest safe mitigation is `kubectl scale deployment karpenter -n kube-system --replicas=0` — this stops all new provisioning/consolidation activity immediately without touching already-running nodes, buying time to fix the NodePool config before resuming. Keep the previous scaling mechanism (a manually-sized managed node group, or cluster-autoscaler if migrating from it) not fully torn down until Karpenter has run cleanly in prod for at least one full traffic cycle (including any weekly/monthly peak), so you have a fallback if a rollback is ever needed.
+
+---
+
+*Compiled from a read-only review of the adCloud monorepo (`cloud/kube-system/`, `argo/ArgoCD/`, vendored Helm chart, per-cluster `values.yaml`) — September 2026. Section 9 is guidance synthesized from the fleet's existing working configuration plus standard Karpenter production practices for gaps this fleet currently leaves open; it is not a transcription of a documented internal process.*
